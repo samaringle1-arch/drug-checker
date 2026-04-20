@@ -1,3 +1,4 @@
+import re
 import httpx
 
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
@@ -9,11 +10,19 @@ SEVERITY_COLORS = {
     "unknown": "gray",
 }
 
-# Keywords scanned against the FULL label text, not just the snippet
 HIGH_KEYWORDS = [
-    "contraindicated","avoid", "do not use", "fatal", "life-threatening",
-    "severe bleeding", "serious bleeding", "hemorrhage", "major bleeding",
+    "contraindicated", "do not use", "fatal", "life-threatening",
     "do not administer", "must not", "should not be used",
+    "should be avoided", "strongly advise",
+    "avoid",
+    "not recommended",
+    "potentially fatal", "risk of death",
+    "severe toxicity", "serious adverse", "severe interaction",
+    "risk of serious",
+    "severe bleeding", "serious bleeding", "major bleeding", "hemorrhage",
+    "respiratory depression", "serotonin syndrome", "cardiac arrest",
+    "severe hypotension", "anaphylaxis",
+    "torsades de pointes", "QT prolongation", "severe CNS depression",
 ]
 
 MODERATE_KEYWORDS = [
@@ -22,18 +31,16 @@ MODERATE_KEYWORDS = [
     "potentiate", "enhance", "inhibit", "bleeding risk", "inr",
     "anticoagulant effect", "reduce dose", "adjust dose", "closely monitor",
     "coadministration", "co-administration",
+    "use with caution", "concurrent use", "concomitant use", "drug interaction",
 ]
 
 LOW_KEYWORDS = [
     "minor", "mild", "minimal", "slight", "generally safe",
+    "no clinically significant", "unlikely to be clinically significant",
 ]
 
 
 def parse_severity(full_label_text: str) -> str:
-    """
-    Scan the FULL label interaction text for severity keywords.
-    Order: high → moderate → low → unknown.
-    """
     t = full_label_text.lower()
     if any(w in t for w in HIGH_KEYWORDS):
         return "high"
@@ -44,29 +51,37 @@ def parse_severity(full_label_text: str) -> str:
     return "unknown"
 
 
-def extract_snippet(text: str, keyword: str, context: int = 350) -> str:
-    """
-    Extract a readable snippet around the keyword mention for display.
-    """
-    idx = text.lower().find(keyword.lower())
-    if idx == -1:
-        return text[:context].strip()
-    start = max(0, idx - 80)
-    end = min(len(text), idx + context)
-    snippet = text[start:end].strip()
-    # Try to start at a sentence boundary
-    if start > 0 and snippet and not snippet[0].isupper():
-        dot = snippet.find(". ")
-        if dot != -1 and dot < 80:
-            snippet = snippet[dot + 2:]
-    return snippet
+def clean_fda_text(text: str) -> str:
+    text = re.sub(r'\b\d+\.\d+(\.\d+)?\s+', '', text)
+    text = re.sub(
+        r'\b([A-Z]{2,})(?:\s+[A-Z]{2,}){0,4}\b',
+        lambda m: m.group().title(),
+        text
+    )
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def extract_relevant_sentences(text: str, keyword: str, max_chars: int = 300) -> str:
+    cleaned = clean_fda_text(text)
+    sentences = re.split(r'(?<=[.!?])\s+', cleaned)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
+    keyword_lower = keyword.lower()
+    relevant = [s for s in sentences if keyword_lower in s.lower()]
+    if not relevant:
+        fallback = ' '.join(sentences[:2])
+        return fallback[:max_chars].rsplit(' ', 1)[0] if len(fallback) > max_chars else fallback
+    result_parts = []
+    total = 0
+    for sent in relevant:
+        if total + len(sent) > max_chars and result_parts:
+            break
+        result_parts.append(sent)
+        total += len(sent) + 1
+    return ' '.join(result_parts)
 
 
 async def fetch_interaction_text(generic_name: str, rxcui: str) -> str | None:
-    """
-    Fetch the full drug_interactions section from the FDA drug label.
-    Tries RxCUI first (precise), then generic name, then substance name.
-    """
     queries = [
         f'openfda.rxcui:"{rxcui}"',
         f'openfda.generic_name:"{generic_name}"',
@@ -75,18 +90,14 @@ async def fetch_interaction_text(generic_name: str, rxcui: str) -> str | None:
     async with httpx.AsyncClient(timeout=15.0) as client:
         for query in queries:
             try:
-                resp = await client.get(
-                    OPENFDA_LABEL_URL,
-                    params={"search": query, "limit": 1}
-                )
+                resp = await client.get(OPENFDA_LABEL_URL, params={"search": query, "limit": 1})
                 if resp.status_code != 200:
                     continue
                 data = resp.json()
                 results = data.get("results") or []
                 if not results:
                     continue
-                label = results[0]
-                sections = label.get("drug_interactions") or []
+                sections = results[0].get("drug_interactions") or []
                 if sections:
                     return " ".join(sections)
             except Exception:
@@ -95,39 +106,20 @@ async def fetch_interaction_text(generic_name: str, rxcui: str) -> str | None:
 
 
 async def check_interactions(resolved_drugs: list[dict]) -> dict:
-    """
-    Check drug-drug interactions using OpenFDA drug label data.
-    resolved_drugs: list of {"input": str, "generic": str, "rxcui": str}
-
-    For each unique pair (A, B):
-      - Fetch full FDA label drug_interactions text for A and B
-      - Check if A's label mentions B's name (and vice versa)
-      - Parse severity from the FULL label text (not just the snippet)
-      - Extract a short readable snippet for display
-    """
     if len(resolved_drugs) < 2:
-        return {
-            "has_interactions": False,
-            "interactions": [],
-            "message": "Need at least 2 drugs to check interactions.",
-        }
+        return {"has_interactions": False, "interactions": [], "message": "Need at least 2 drugs."}
 
-    # Deduplicate by rxcui
-    seen_rxcuis: set[str] = set()
+    seen: set[str] = set()
     unique_drugs: list[dict] = []
     for d in resolved_drugs:
-        if d["rxcui"] not in seen_rxcuis:
-            seen_rxcuis.add(d["rxcui"])
+        if d["rxcui"] not in seen:
+            seen.add(d["rxcui"])
             unique_drugs.append(d)
 
-    # Step 1: Fetch full label text for each unique drug
     label_texts: dict[str, str | None] = {}
     for drug in unique_drugs:
-        label_texts[drug["rxcui"]] = await fetch_interaction_text(
-            drug["generic"], drug["rxcui"]
-        )
+        label_texts[drug["rxcui"]] = await fetch_interaction_text(drug["generic"], drug["rxcui"])
 
-    # Step 2: Check every unique pair
     interaction_results = []
     checked_pairs: set[tuple] = set()
 
@@ -140,25 +132,24 @@ async def check_interactions(resolved_drugs: list[dict]) -> dict:
                 continue
             checked_pairs.add(pair_key)
 
-            matched_full_text = None  # full label text used for severity
-            snippet = None            # short excerpt used for display
-            matched_from = None       # which drug's label had the mention
+            matched_full_text = None
+            snippet = None
+            matched_from = None
 
             text_a = label_texts.get(drug_a["rxcui"])
             if text_a and drug_b["generic"].lower() in text_a.lower():
                 matched_full_text = text_a
-                snippet = extract_snippet(text_a, drug_b["generic"])
+                snippet = extract_relevant_sentences(text_a, drug_b["generic"])
                 matched_from = drug_a["generic"]
 
             if not matched_full_text:
                 text_b = label_texts.get(drug_b["rxcui"])
                 if text_b and drug_a["generic"].lower() in text_b.lower():
                     matched_full_text = text_b
-                    snippet = extract_snippet(text_b, drug_a["generic"])
+                    snippet = extract_relevant_sentences(text_b, drug_a["generic"])
                     matched_from = drug_b["generic"]
 
             if matched_full_text and snippet:
-                # KEY FIX: severity parsed from full label, not just the snippet
                 severity = parse_severity(matched_full_text)
                 interaction_results.append({
                     "drug1":       drug_a["generic"],
